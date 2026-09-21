@@ -15,21 +15,23 @@ export async function onRequestGet(context) {
     const listed = await bucket.list({ prefix: "books/" });
     const publicDomain = (env.R2_PUBLIC_DOMAIN || "").replace(/\/$/, "");
 
-    // 파일 목록을 서재 책 데이터 형태로 변환
-    const books = listed.objects.map((obj) => {
-      // 파일 키(예: books/17123456_Twilight.pdf)에서 제목 추출
-      const fileName = obj.key.replace(/^books\/\d+_/, "").replace(/\.pdf$/i, "");
-      const decodedTitle = decodeURIComponent(fileName).replace(/_/g, " ");
+    // [수정] 폴더(books/) 제외 및 순수 .pdf 파일만 골라내기
+    const books = listed.objects
+      .filter((obj) => obj.key.toLowerCase().endsWith(".pdf"))
+      .map((obj) => {
+        // 파일 키에서 타임스탬프 제거 및 제목 가공
+        const fileName = obj.key.replace(/^books\/\d+_/, "").replace(/\.pdf$/i, "");
+        const decodedTitle = decodeURIComponent(fileName).replace(/_/g, " ");
 
-      return {
-        id: obj.key,
-        title: decodedTitle,
-        fileKey: obj.key,
-        publicUrl: `${publicDomain}/${obj.key}`,
-        size: obj.size,
-        addedAt: new Date(obj.uploaded).toLocaleDateString(),
-      };
-    });
+        return {
+          id: obj.key,
+          title: decodedTitle,
+          fileKey: obj.key,
+          publicUrl: `${publicDomain}/${obj.key}`,
+          size: obj.size,
+          addedAt: new Date(obj.uploaded).toLocaleDateString(),
+        };
+      });
 
     // 최신 등록 순으로 정렬
     books.reverse();
