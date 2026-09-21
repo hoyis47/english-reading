@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import * as pdfjsLib from "pdfjs-dist";
 import { analyzeWithGemini } from "./api/gemini";
 import { uploadPdfToR2 } from "./api/r2";
@@ -30,11 +30,12 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [bookTitle, setBookTitle] = useState("English Book Reader");
 
-  // 등록된 책 목록 관리 (로컬스토리지 연동)
+  // R2 버킷에서 동기화되는 서버 책 목록
   const [savedBooks, setSavedBooks] = useState([]);
   const [activeBookId, setActiveBookId] = useState(null);
   const [isLibraryOpen, setIsLibraryOpen] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
+  const [isFetchingBooks, setIsFetchingBooks] = useState(false);
 
   // 테마 모드: 'day' / 'night'
   const [theme, setTheme] = useState("day");
@@ -48,23 +49,31 @@ export default function App() {
     error: null,
   });
 
-  // 1. 처음 실행 시 로컬스토리지에서 등록된 책 목록 복원
-  useEffect(() => {
-    const localData = localStorage.getItem("r2_saved_books");
-    if (localData) {
-      try {
-        setSavedBooks(JSON.parse(localData));
-      } catch (e) {
-        console.error("서재 데이터 로드 오류:", e);
+  // [핵심 1] 로컬/배포 환경 자동 판별 및 R2 책 목록 불러오기
+  const fetchBooksFromServer = useCallback(async () => {
+    setIsFetchingBooks(true);
+    try {
+      // 로컬 개발 환경(포트 5173)이면 로컬 백엔드(3001)로, 배포 환경이면 Cloudflare Functions(/api/books)로 요청
+      const isLocalDev = window.location.hostname === "localhost" && window.location.port === "5173";
+      const endpoint = isLocalDev ? "http://localhost:3001/api/books" : "/api/books";
+
+      const res = await fetch(endpoint);
+      if (!res.ok) {
+        throw new Error(`목록 조회 실패: HTTP ${res.status}`);
       }
+      const data = await res.json();
+      setSavedBooks(Array.isArray(data) ? data : []);
+    } catch (err) {
+      console.error("R2 책 목록 불러오기 실패:", err);
+    } finally {
+      setIsFetchingBooks(false);
     }
   }, []);
 
-  // 2. 책 목록 변경 시 로컬스토리지 자동 동기화
-  const updateSavedBooks = (newBooks) => {
-    setSavedBooks(newBooks);
-    localStorage.setItem("r2_saved_books", JSON.stringify(newBooks));
-  };
+  // 화면 첫 마운트 시 책 목록 자동 조회
+  useEffect(() => {
+    fetchBooksFromServer();
+  }, [fetchBooksFromServer]);
 
   // 브라우저 내장 TTS 음성 낭독
   const speakText = (textToSpeak) => {
@@ -79,16 +88,15 @@ export default function App() {
     window.speechSynthesis.speak(utterance);
   };
 
-  // [핵심] R2 URL 또는 ArrayBuffer로부터 PDF 로드
-  const loadPdfSource = async (source, title, bookId = null, startPage = 1) => {
+  // R2 URL로부터 PDF 로드
+  const loadPdfSource = async (url, title, bookId = null, startPage = 1) => {
     setLoading(true);
     setBookTitle(title);
     if (bookId) setActiveBookId(bookId);
 
     try {
       const loadingTask = pdfjsLib.getDocument({
-        url: typeof source === "string" ? source : undefined,
-        data: source instanceof ArrayBuffer ? source : undefined,
+        url: url,
         cMapUrl: `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/cmaps/`,
         cMapPacked: true,
       });
@@ -106,7 +114,7 @@ export default function App() {
     }
   };
 
-  // 신규 PDF를 R2에 등록하고 즉시 서재에 추가하는 핸들러
+  // [핵심 2] 신규 PDF를 R2에 등록하고 즉시 전체 목록 재동기화
   const handleRegisterBook = async (e) => {
     const file = e.target.files[0];
     if (!file) return;
@@ -115,50 +123,37 @@ export default function App() {
     setIsUploading(true);
 
     try {
-      // 1. Cloudflare R2에 업로드
+      // 1. Cloudflare R2에 업로드 (로컬은 server.js:3001, 배포는 /api/upload)
       const { fileKey, publicUrl } = await uploadPdfToR2(file);
 
-      // 2. 메타데이터 객체 생성
-      const newBook = {
-        id: `book_${Date.now()}`,
-        title: title,
-        fileKey: fileKey,
-        publicUrl: publicUrl,
-        addedAt: new Date().toLocaleDateString(),
-        lastPage: 1,
-      };
+      // 2. 서버의 R2 버킷 목록을 즉시 다시 읽어와 서재 동기화
+      await fetchBooksFromServer();
 
-      // 3. 서재 저장 및 업데이트
-      const nextList = [newBook, ...savedBooks];
-      updateSavedBooks(nextList);
-
-      // 4. 업로드 완료 즉시 화면에 책 펼치기
-      await loadPdfSource(publicUrl, title, newBook.id, 1);
+      // 3. 업로드 완료 즉시 화면에 책 펼치기
+      await loadPdfSource(publicUrl, title, fileKey, 1);
       setIsLibraryOpen(false);
-      alert(`[${title}] 책이 R2에 안전하게 등록되었습니다!`);
+      alert(`[${title}] 책이 R2 클라우드에 안전하게 등록되었습니다!`);
     } catch (err) {
       console.error("R2 업로드 실패:", err);
       alert("R2 등록 중 오류가 발생했습니다: " + err.message);
     } finally {
       setIsUploading(false);
-      e.target.value = ""; // 파일 인풋 리셋
+      e.target.value = ""; // 파일 인풋 초기화
     }
   };
 
-  // 등록된 책 삭제
-  const handleDeleteBook = (id, e) => {
+  // 등록된 책 닫기/해제 (화면 비우기)
+  const handleCloseActiveBook = (id, e) => {
     e.stopPropagation();
-    if (!window.confirm("서재에서 이 책을 삭제하시겠습니까?")) return;
-    const filtered = savedBooks.filter((b) => b.id !== id);
-    updateSavedBooks(filtered);
     if (activeBookId === id) {
       setPdfDoc(null);
       setPageText("");
       setBookTitle("English Book Reader");
+      setActiveBookId(null);
     }
   };
 
-  // 텍스트 추출 로직 (Twilight 머리글 필터 및 줄바꿈 보존)
+  // 텍스트 추출 로직 (소설 머리글 필터 및 줄바꿈 보존)
   const extractPageText = async (doc, pageNum) => {
     setLoading(true);
     try {
@@ -191,21 +186,13 @@ export default function App() {
     }
   };
 
-  // 페이지 이동 및 마지막 읽은 페이지 갱신
+  // 페이지 이동
   const changePage = (offset) => {
     const newPage = currentPage + offset;
     if (newPage >= 1 && newPage <= totalPages && pdfDoc) {
       setCurrentPage(newPage);
       setPanel((prev) => ({ ...prev, visible: false }));
       extractPageText(pdfDoc, newPage);
-
-      // 서재에 마지막 페이지 자동 저장
-      if (activeBookId) {
-        const updated = savedBooks.map((b) =>
-          b.id === activeBookId ? { ...b, lastPage: newPage } : b
-        );
-        updateSavedBooks(updated);
-      }
     }
   };
 
@@ -261,7 +248,7 @@ export default function App() {
           isNight ? "bg-[#222226] border-[#323238] text-stone-200" : "bg-white border-stone-200 text-stone-800"
         }`}
       >
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-3 flex-wrap">
           <h1
             className="text-xl font-bold flex items-center gap-2 max-w-xs sm:max-w-md truncate"
             title={bookTitle}
@@ -271,7 +258,10 @@ export default function App() {
 
           {/* 서재 모달 열기 버튼 */}
           <button
-            onClick={() => setIsLibraryOpen(true)}
+            onClick={() => {
+              fetchBooksFromServer();
+              setIsLibraryOpen(true);
+            }}
             className="text-sm px-3.5 py-2 rounded-lg font-medium transition shadow-sm bg-amber-600 hover:bg-amber-700 text-white flex items-center gap-1.5"
           >
             📚 등록된 책 서재 ({savedBooks.length})
@@ -538,9 +528,19 @@ export default function App() {
             }`}
           >
             <div className="flex justify-between items-center pb-4 border-b border-stone-500/20 mb-4">
-              <h2 className="text-lg font-bold flex items-center gap-2">
-                📚 Cloudflare R2 원서 서재
-              </h2>
+              <div className="flex items-center gap-2">
+                <h2 className="text-lg font-bold flex items-center gap-2">
+                  📚 Cloudflare R2 원서 서재
+                </h2>
+                <button
+                  onClick={fetchBooksFromServer}
+                  disabled={isFetchingBooks}
+                  className="text-xs px-2 py-1 bg-stone-200 hover:bg-stone-300 dark:bg-stone-700 dark:hover:bg-stone-600 rounded text-stone-700 dark:text-stone-300 transition"
+                  title="서재 새로고침"
+                >
+                  {isFetchingBooks ? "조회 중..." : "🔄 새로고침"}
+                </button>
+              </div>
               <button
                 onClick={() => setIsLibraryOpen(false)}
                 className="text-stone-400 hover:text-stone-100 text-lg px-2 py-1 rounded"
@@ -553,17 +553,23 @@ export default function App() {
             <div className="flex-1 overflow-y-auto space-y-2.5 pr-1">
               {savedBooks.length === 0 ? (
                 <div className="text-center py-12 text-stone-400 text-sm">
-                  아직 등록된 책이 없습니다.<br />
-                  상단의 <b>[+ 새 책 등록(R2)]</b> 버튼으로 첫 원서를 등록해보세요!
+                  {isFetchingBooks ? (
+                    "R2 클라우드에서 책 목록을 불러오는 중입니다..."
+                  ) : (
+                    <>
+                      등록된 책이 없습니다.<br />
+                      상단의 <b>[+ 새 책 등록(R2)]</b> 버튼으로 첫 원서를 등록해보세요!
+                    </>
+                  )}
                 </div>
               ) : (
                 savedBooks.map((book) => {
-                  const isCurrent = activeBookId === book.id;
+                  const isCurrent = activeBookId === book.id || activeBookId === book.fileKey;
                   return (
                     <div
-                      key={book.id}
+                      key={book.id || book.fileKey}
                       onClick={() => {
-                        loadPdfSource(book.publicUrl, book.title, book.id, book.lastPage || 1);
+                        loadPdfSource(book.publicUrl, book.title, book.id || book.fileKey, 1);
                         setIsLibraryOpen(false);
                       }}
                       className={`p-3.5 rounded-xl border flex items-center justify-between gap-3 cursor-pointer transition ${
@@ -579,21 +585,26 @@ export default function App() {
                         <div className="overflow-hidden">
                           <h4 className="font-semibold text-sm truncate">{book.title}</h4>
                           <div className="text-xs text-stone-400 mt-0.5 flex gap-2">
-                            <span>등록일: {book.addedAt}</span>
-                            <span>•</span>
-                            <span>마지막 페이지: {book.lastPage || 1}p</span>
+                            <span>등록일: {book.addedAt || "-"}</span>
+                            {book.size && (
+                              <>
+                                <span>•</span>
+                                <span>{(book.size / (1024 * 1024)).toFixed(1)} MB</span>
+                              </>
+                            )}
                           </div>
                         </div>
                       </div>
 
-                      <div className="flex items-center gap-2 shrink-0">
+                      {isCurrent && (
                         <button
-                          onClick={(e) => handleDeleteBook(book.id, e)}
-                          className="text-xs text-red-400 hover:text-red-300 hover:bg-red-950/40 px-2.5 py-1.5 rounded transition border border-red-900/30"
+                          onClick={(e) => handleCloseActiveBook(book.id || book.fileKey, e)}
+                          className="text-xs text-amber-500 hover:text-amber-400 px-2.5 py-1 rounded transition border border-amber-500/30"
+                          title="열린 책 닫기"
                         >
-                          삭제
+                          닫기
                         </button>
-                      </div>
+                      )}
                     </div>
                   );
                 })

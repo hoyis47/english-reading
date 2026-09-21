@@ -2,17 +2,16 @@
 import express from "express";
 import cors from "cors";
 import multer from "multer";
-import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, PutObjectCommand, ListObjectsV2Command } from "@aws-sdk/client-s3"; // ListObjectsV2Command 추가
 import dotenv from "dotenv";
 
 dotenv.config();
 
 const app = express();
-app.use(cors()); // 모든 접근 허용
+app.use(cors());
 
 const upload = multer({ storage: multer.memoryStorage() });
 
-// 백엔드 Node.js에서 R2와 직접 통신 (CORS 차단 전혀 없음)
 const r2 = new S3Client({
   region: "auto",
   endpoint: `https://${process.env.VITE_R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
@@ -22,6 +21,7 @@ const r2 = new S3Client({
   },
 });
 
+// 1. 책 등록 (업로드)
 app.post("/api/upload", upload.single("file"), async (req, res) => {
   try {
     const file = req.file;
@@ -51,6 +51,43 @@ app.post("/api/upload", upload.single("file"), async (req, res) => {
   }
 });
 
+// 2. [추가] R2 버킷에 저장된 책 목록 조회 (로컬용)
+app.get("/api/books", async (req, res) => {
+  try {
+    const data = await r2.send(
+      new ListObjectsV2Command({
+        Bucket: "english-reading",
+        Prefix: "books/",
+      })
+    );
+
+    const publicDomain = (process.env.VITE_R2_PUBLIC_DOMAIN || "").replace(/\/$/, "");
+    const items = data.Contents || [];
+
+    const books = items
+      .filter((obj) => obj.Key !== "books/") // 폴더 자체 항목 제외
+      .map((obj) => {
+        const fileName = obj.Key.replace(/^books\/\d+_/, "").replace(/\.pdf$/i, "");
+        const title = decodeURIComponent(fileName).replace(/_/g, " ");
+
+        return {
+          id: obj.Key,
+          title: title,
+          fileKey: obj.Key,
+          publicUrl: `${publicDomain}/${obj.Key}`,
+          size: obj.Size,
+          addedAt: new Date(obj.LastModified).toLocaleDateString(),
+        };
+      });
+
+    books.reverse(); // 최신순 정렬
+    res.json(books);
+  } catch (error) {
+    console.error("❌ R2 목록 조회 오류:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.listen(3001, "0.0.0.0", () => {
-  console.log("🚀 로컬 업로드 서버 실행 중 (포트 3001)");
+  console.log("🚀 로컬 업로드/조회 서버 실행 중 (포트 3001)");
 });
